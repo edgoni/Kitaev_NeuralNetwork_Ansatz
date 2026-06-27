@@ -1,0 +1,17 @@
+# --- Librerías Core de Física y Machine Learning ---
+netket>=3.14.0
+jax>=0.4.35
+jaxlib>=0.4.35
+flax>=0.8.0
+optax>=0.2.0
+
+# --- Manipulación de Datos y Matemáticas ---
+# NumPy 2.1+ y SciPy 1.14+ son recomendados para compatibilidad nativa con Python 3.13
+numpy>=2.0.0
+scipy>=1.14.0
+pandas>=2.2.0
+
+# --- Visualización y Logging ---
+matplotlib>=3.9.0
+tensorboard>=2.18.0
+tensorboardX>=2.6.2.2
