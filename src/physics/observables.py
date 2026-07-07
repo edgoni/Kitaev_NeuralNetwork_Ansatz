@@ -1,7 +1,8 @@
 from collections import defaultdict
-from typing import List, Tuple
+from typing import List, Tuple,Dict
 from netket.operator.spin import sigmaz, sigmax, sigmay
 import netket as nk
+import numpy as np
 
 def get_kitaev_plaquettes(graph: nk.graph.Graph) -> Tuple[List[List[int]], List[List[str]]]:
     """
@@ -44,7 +45,7 @@ def get_kitaev_plaquettes(graph: nk.graph.Graph) -> Tuple[List[List[int]], List[
     return plaquetas, operadores
 
 def build_wilson_loops(hi: nk.hilbert.AbstractHilbert, plaquetas: List[List[int]], ops_colores: List[List[str]]) -> Tuple[List[nk.operator.LocalOperator], nk.operator.LocalOperator]:
-    """
+    """ 
     Construye los operadores locales de Wilson loop (Wp) para cada plaqueta.
     """
     mapa_sigmas = {'x': sigmax, 'y': sigmay, 'z': sigmaz}
@@ -84,3 +85,47 @@ def _build_cycle(start: int, seq_colores: List[str], vecinos_color: dict) -> Lis
 def _calculate_ops(ciclo: List[int], seq_colores: List[str], todos: set) -> List[str]:
     n = len(ciclo)
     return [(todos - {seq_colores[(i - 1) % n], seq_colores[i]}).pop() for i in range(n)]
+
+
+## Resto de Observables a comparar y estudiar
+
+
+def build_sparse_observables(hi: nk.hilbert.AbstractHilbert, graph: nk.graph.Graph) -> Dict:
+    """Construye operadores locales para muestreo MCMC."""
+    num_sites = graph.n_nodes
+    ops = {}
+    
+    # Magnetizaciones locales sumadas
+    for d, op_func in zip(['Mx', 'My', 'Mz'], [sigmax, sigmay, sigmaz]):
+        ops[d] = sum(op_func(hi, i) for i in range(num_sites)) / num_sites
+        
+    # Correlación S^zz global
+    szz_op = 0
+    for i in range(num_sites):
+        for j in range(i + 1, num_sites):
+            szz_op += sigmaz(hi, i) @ sigmaz(hi, j)
+    ops['Szz'] = szz_op / (num_sites * (num_sites - 1) / 2)
+    
+    # Bucle de Wilson promedio Wp
+    plaquetas, ops_colores = get_kitaev_plaquettes(graph)
+    _, Wp_total = build_wilson_loops(hi, plaquetas, ops_colores)
+    if Wp_total is not None:
+        ops['Wp'] = Wp_total
+        
+    return ops
+
+def calculate_dense_metrics(psi_dense: np.ndarray, psi_exact: np.ndarray = None) -> Tuple[float, float]:
+    """Calcula Coherencia C_l1 y Overlap/Fidelidad exacta utilizando vectores densos."""
+    psi_norm = psi_dense / np.linalg.norm(psi_dense)
+    
+    # Coherencia l1: C_l1 = (\sum_i |\psi_i|)^2 - \sum_i |\psi_i|^2
+    abs_psi = np.abs(psi_norm)
+    c_l1 = float(np.sum(abs_psi)**2 - 1.0)
+    
+    # Fidelidad / Overlap exacto
+    fidelity = np.nan
+    if psi_exact is not None:
+        psi_ed_norm = psi_exact / np.linalg.norm(psi_exact)
+        fidelity = float(np.abs(np.vdot(psi_ed_norm, psi_norm))**2)
+        
+    return c_l1, fidelity

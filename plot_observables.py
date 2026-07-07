@@ -1,255 +1,265 @@
-# plot_observables.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+=============================================================================
+TFM: Neural-Network Quantum States for Many-Body Quantum Spin Systems
+Author: Eduardo Goñi Crespo
+Advisor: Master's Thesis Advisor & Computational Physics Expert
+
+Module: evaluate_all_observables.py
+Description:
+    Evaluación exhaustiva de estados variacionales NQS (.mpack) frente a 
+    Diagonalización Exacta (ED). Calcula estimadores MCMC y densos exactos:
+      - Energía del Estado Fundamental (E0 / N)
+      - Componentes de Magnetización (<Mx>, <My>, <Mz>, M_total)
+      - Correlación de espín a dos cuerpos (<Szz>)
+      - Operadores de bucle de Wilson plaquetarios (<Wp>)
+      - Coherencia Cuántica en norma l1 (C_l1)
+      - Fidelidad Cuántica Exacta / Overlap (|⟨ψ_ED | ψ_NQS⟩|²)
+=============================================================================
+"""
+
 import os
-import sys
 import re
 import glob
-import pickle
 import gc
+import pickle
+import warnings
+from collections import defaultdict
+from typing import List, Tuple, Dict
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+import jax
 import jax.numpy as jnp
+import flax.serialization
 import netket as nk
+from netket.operator.spin import sigmax, sigmay, sigmaz
 
-from netket.operator.spin import sigmaz, sigmax, sigmay
+# Importaciones del repositorio (física y modelos)
+try:
+    from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
+    from src.physics.exact_diag import run_exact_diagonalization, load_exact_results
+    from src.models.rbm import RBM
+    from src.models.quantumself import QuantumSelfAttention
+    from src.physics.observables import build_sparse_observables, calculate_dense_metrics
+except ImportError:
+    warnings.warn(
+        "[WARN] Módulos de 'src/' no encontrados mediante importación absoluta. "
+        "Asegúrate de ejecutar desde la raíz del repositorio."
+    )
 
-# --- Importaciones de tu código limpio ---
-from src.physics.hamiltonian import build_kitaev_lattice
-from src.physics.symmetries import get_kitaev_symmetries
-from src.physics.observables import get_kitaev_plaquettes, build_wilson_loops
-from src.models.rbm import ProjectedRBM
+# Estilo académico para gráficos LaTeX-ready
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 12,
+    "axes.labelsize": 14,
+    "axes.titlesize": 14,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "figure.dpi": 300,
+})
 
-# ============================================================
-# 0. CONFIGURACIÓN Y EXPRESIONES REGULARES
-# ============================================================
-# TODO: Ajusta este patrón según cómo estés guardando los archivos en main.py
-# Por defecto asume que el nombre contiene Layers y Jz. Ej: vstate_RBM_L2_Jz0.5.pkl
-PKL_PATTERN = r"vstate_.*?L(\d+)_Jz([\d.]+).*\.pkl" 
 
-def parse_pkl_name(fname):
-    """Devuelve (layers, jz) o None si no encaja el patrón."""
-    m = re.search(PKL_PATTERN, os.path.basename(fname))
-    if m:
-        return int(m.group(1)), float(m.group(2))
-    return None
+# =============================================================================
+# 3. METADATA PARSING & HELPERS
+# =============================================================================
+MPACK_PATTERN = re.compile(r"^([A-Za-z]+)_.*N?(\d+).*_Jz([0-9.]+)\.mpack$")
 
-# ============================================================
-# 1. HELPERS MATEMÁTICOS PARA OBSERVABLES EXTRAS
-# ============================================================
-def build_sparse_ops(hi, num_sites):
-    ops = {'x': sigmax, 'y': sigmay, 'z': sigmaz}
-    sparse_single_ops = {
-        d: [ops[d](hi, i).to_sparse() for i in range(num_sites)]
-        for d in ('x', 'y', 'z')
-    }
-    return sparse_single_ops
+def parse_mpack_filename(filepath: str):
+    filename = os.path.basename(filepath)
+    match = MPACK_PATTERN.match(filename)
+    if match:
+        return match.group(1), int(match.group(2)) if match.group(2) else 18, float(match.group(3))
+    jz_match = re.search(r"Jz([0-9.]+)", filename)
+    if jz_match:
+        return filename.split("_")[0], 18, float(jz_match.group(1))
+    return None, None, None
 
-def magnetization_components(psi, sparse_single_ops, N_sites):
-    M_vals, M_sq = {}, 0.0
-    for d in ('x', 'y', 'z'):
-        val = np.real(sum(np.vdot(psi, op @ psi) for op in sparse_single_ops[d])) / N_sites
-        M_vals[d] = val
-        M_sq += val ** 2
-    M_vals['total'] = np.sqrt(M_sq)
-    return M_vals
+def get_model_instance(ansatz_name: str = "QuantumSelf"):
+    ansatz_upper = ansatz_name.upper()
+    if "TRANSFORMER" in ansatz_upper or "SELFATT" in ansatz_upper:
+        return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
+    elif "FACTORED" in ansatz_upper:
+        return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
+    return RBM(alpha=2, param_dtype=jnp.complex128)
 
-def S_corr_zz(hi, psi, sparse_ops_z):
-    S = 0.0
-    for i, opi in enumerate(sparse_ops_z):
-        for j, opj in enumerate(sparse_ops_z):
-            if i != j:
-                S += np.real(np.vdot(psi, opi @ (opj @ psi)))
-    return S
-
-def quantum_coherence_l1(psi):
-    abs_psi = np.abs(psi)
-    return float(np.sum(abs_psi) ** 2 - np.sum(abs_psi ** 2))
-
-def evaluate_wilson_loop(psi, Wp_total_op):
-    """Evalúa el observable global de Wilson usando matrices dispersas para el estado denso."""
-    # Convertimos el operador de NetKet a matriz dispersa para multiplicarlo por el vector psi
-    Wp_sparse = Wp_total_op.to_sparse()
-    return float(np.real(np.vdot(psi, Wp_sparse @ psi)))
-
-# ============================================================
-# MAIN SCRIPT
-# ============================================================
-def main():
-    print("--- Inicializando Entorno para Análisis de Observables ---")
+# =============================================================================
+# 4. MOTOR DE EVALUACIÓN GLOBAL (MCMC + EXACT VECTOR)
+# =============================================================================
+def evaluate_all(
+    checkpoint_dir: str = "data/checkpoints",
+    output_csv: str = "observables_all_evaluated.csv",
+    n_samples: int = 16384
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     
-    # 1. Configurar Física (Igual que en run_vmc.py)
-    extent = [3, 3]
-    graph, hilbert = build_kitaev_lattice(extent=extent, pbc=True)
-    N = graph.n_nodes
+    mpack_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.mpack")))
+    if not mpack_files:
+        raise FileNotFoundError(f"No se encontraron checkpoints .mpack en {checkpoint_dir}")
+
+    records_nqs = []
+    exact_cache = {}
     
-    plaquetas, ops_colores = get_kitaev_plaquettes(graph)
-    Wp_list, Wp_total = build_wilson_loops(hilbert, plaquetas, ops_colores)
-    
-    symmetries_info = get_kitaev_symmetries(graph, hilbert)
-    sparse_single_ops = build_sparse_ops(hilbert, N)
-    sampler_dummy = nk.sampler.MetropolisLocal(hilbert)
+    print(f"\n[INFO] Evaluando {len(mpack_files)} checkpoints NQS con N_samples={n_samples}...")
 
-    # Convertimos a Tuplas para que Flax no de el HashError
-    irrep_index = 0
-    symm_tuple = tuple(map(tuple, symmetries_info["irreps_matrices"][irrep_index].tolist()))
-    char_tuple = tuple(symmetries_info["character_table"][irrep_index].tolist())
+    for fpath in mpack_files:
+        ansatz_name, num_sites, jz = parse_mpack_filename(fpath)
+        if jz is None: continue
+        
+        print(f" -> Procesando: {os.path.basename(fpath)} | Ansatz: {ansatz_name} | Jz: {jz:.2f}")
 
-    # 2. Cargar Datos Exactos (Si existen)
-    path_energies = 'data/raw/energies_eigenvecs.npz' # Ajusta la ruta a tu ED
-    exact_dict = {}
-    jz_values_exact = []
-    
-    if os.path.exists(path_energies):
-        data_exact = np.load(path_energies)
-        jz_values_exact = np.linspace(0, 1, 11)
-        exact_dict = {
-            round(jz_values_exact[i], 2): data_exact['vecs'][i, :, 0]
-            for i in range(len(jz_values_exact))
-        }
-        print(f"[OK] Datos de Diagonalización Exacta cargados desde {path_energies}")
-    else:
-        print(f"[AVISO] No se encontró {path_energies}. Se omitirá el overlap.")
-
-    # 3. Buscar PKLs en la carpeta local o de resultados
-    SEARCH_DIRS = [".", "data/weights", "Resultados"]
-    pkl_files = []
-    
-    for d in SEARCH_DIRS:
-        if os.path.isdir(d):
-            found = glob.glob(os.path.join(d, "*.pkl"))
-            if found:
-                pkl_files.extend(found)
-
-    parsed = [(f, parse_pkl_name(f)) for f in pkl_files]
-    valid = [(f, meta) for f, meta in parsed if meta is not None]
-
-    if not valid:
-        print("\n[ERROR] No se encontraron archivos .pkl válidos.")
-        print(f"Asegúrate de que tus pkls cumplan el Regex: {PKL_PATTERN}")
-        sys.exit(1)
-
-    print(f"\n[OK] Encontrados {len(valid)} archivos .pkl válidos para analizar.")
-
-    rows = []
-    current_layers = None
-    vstate = None
-
-    # 4. Bucle de Evaluación
-    for pkl_path, (layers, jz) in sorted(valid, key=lambda x: (x[1][0], x[1][1])):
-        print(f"Evaluando: L={layers}, Jz={jz:.2f} -> {os.path.basename(pkl_path)}")
-
-        # Solo reinstanciamos el modelo si cambia el número de capas
-        if layers != current_layers:
-            model = ProjectedRBM(
-                num_layers=layers,
-                alpha=1.0, 
-                param_dtype=jnp.complex128,
-                symmetries=symm_tuple,
-                characters=char_tuple
-            )
-            vstate = nk.vqs.MCState(sampler_dummy, model, n_samples=2)
-            current_layers = layers
-
-        # Cargar pesos
-        with open(pkl_path, 'rb') as f:
-            params = pickle.load(f)
-        vstate.parameters = params
-
-        # Extraer vector de estado
-        psi_rbm = vstate.to_array()
-        psi_rbm = psi_rbm / np.linalg.norm(psi_rbm)
-
-        # Calcular observables
-        m = magnetization_components(psi_rbm, sparse_single_ops, N)
-        Szz = S_corr_zz(hilbert, psi_rbm, sparse_single_ops['z'])
-        Cl1 = quantum_coherence_l1(psi_rbm)
-        Wp_val = evaluate_wilson_loop(psi_rbm, Wp_total)
-
-        # Overlap
-        jz_key = round(jz, 2)
-        overlap = float('nan')
-        if jz_key in exact_dict:
-            psi_exact = exact_dict[jz_key] / np.linalg.norm(exact_dict[jz_key])
-            overlap = float(np.abs(np.vdot(psi_exact, psi_rbm)) ** 2)
-
-        rows.append({
-            'pkl': os.path.basename(pkl_path),
-            'layers': layers,
-            'Jz': jz,
-            'Mx': m['x'], 'My': m['y'], 'Mz': m['z'], 'M_total': m['total'],
-            'Szz': Szz,
-            'Cl1': Cl1,
-            'Wp': Wp_val,
-            'overlap': overlap
-        })
-
-        del psi_rbm, params
-        gc.collect()
-
-    # 5. Guardar y Graficar
-    df = pd.DataFrame(rows)
-    df.to_csv('resultados_observables.csv', index=False)
-    print("\n[OK] CSV guardado: resultados_observables.csv")
-
-    if df.empty: return
-
-    # Pre-calcular Exactos para los Plots
-    obs_exact = {'Mx': [], 'My': [], 'Mz': [], 'M_total': [], 'Szz': [], 'Cl1': [], 'Wp': []}
-    if jz_values_exact:
-        Wp_sparse = Wp_total.to_sparse()
-        for i, jz_i in enumerate(jz_values_exact):
-            psi = data_exact['vecs'][i, :, 0]
-            psi = psi / np.linalg.norm(psi)
-            m = magnetization_components(psi, sparse_single_ops, N)
+        # 1. Grafo y Espacio de Hilbert
+        graph, hilbert = build_kitaev_lattice(extent=[3,3], pbc=True)
+        N = graph.n_nodes
+        hilbert = nk.hilbert.Spin(s=0.5, N=N)
+        jx = jy = (1 - jz) / 2
+        hamiltonian = KitaevTransverse_H(
+            graph.edge_colors, graph.edges(), 
+            Jx=jx, Jy=jy, Jz=jz, h=0.0, hi=hilbert
+        )
+        
+        # 2. Cargar solución Exacta (ED) para este Jz en caché
+        jz_key = round(jz, 3)
+        run_exact_diagonalization(extent=[3,3], jz_steps=11, k_eigenvals=1, save_path='data/raw/energies_eigenvecs.npz')
+        jz_eigval_eigvec = load_exact_results('data/raw/energies_eigenvecs.npz')
+        if jz_key not in exact_cache:
+            print(f"    [ED] Calculando Diagonalización Exacta de referencia para Jz={jz:.2f}...")
+            jz_eigval_eigvec_temp = jz_eigval_eigvec.get(jz_key)
+            e0_ed, psi0_ed = jz_eigval_eigvec_temp['E0'], jz_eigval_eigvec_temp['psi0']
+            exact_cache[jz_key] = {"Energy": e0_ed.real / num_sites, "psi0": psi0_ed}
             
-            obs_exact['Mx'].append(m['x'])
-            obs_exact['My'].append(m['y'])
-            obs_exact['Mz'].append(m['z'])
-            obs_exact['M_total'].append(m['total'])
-            obs_exact['Szz'].append(S_corr_zz(hilbert, psi, sparse_single_ops['z']))
-            obs_exact['Cl1'].append(quantum_coherence_l1(psi))
-            obs_exact['Wp'].append(float(np.real(np.vdot(psi, Wp_sparse @ psi))))
+            # Observables exactos en ED
+            sparse_ops = build_sparse_observables(hilbert, graph)
+            for obs_name, op in sparse_ops.items():
+                mat_op = op.to_sparse()
+                exact_cache[jz_key][obs_name] = np.vdot(psi0_ed, mat_op @ psi0_ed).real
+            # Coherencia exacta
+            c_l1_ed, _ = calculate_dense_metrics(psi0_ed)
+            exact_cache[jz_key]["Cl1"] = c_l1_ed
 
-    # Configuración de Gráficas
-    observables_config = [
-        ('M_total', obs_exact.get('M_total', None), '$M_{total}$', 'tab:orange'),
-        ('Mz',      obs_exact.get('Mz', None),      '$M_z$',       'tab:red'),
-        ('Szz',     obs_exact.get('Szz', None),     '$S^{zz}$',    'tab:purple'),
-        ('Cl1',     obs_exact.get('Cl1', None),     '$C_{l1}$',    'tab:cyan'),
-        ('Wp',      obs_exact.get('Wp', None),      'Wilson Loop $\\langle W_p \\rangle$', 'tab:green'),
-        ('overlap', None, 'Overlap $|\\langle\\psi_{ED}|\\psi_{RBM}\\rangle|^2$', 'crimson'),
+        # 3. Inicializar NQS y cargar pesos
+        model = get_model_instance(ansatz_name)
+        sampler = nk.sampler.MetropolisExchange(hilbert, graph=graph, d_max=2, n_chains=16)
+        vstate = nk.vqs.MCState(sampler, model, n_samples=n_samples)
+
+        with open(fpath, "rb") as file_handle:
+            state_dict = flax.serialization.from_bytes(vstate.variables, file_handle.read())
+            vstate.variables = state_dict
+
+        row = {
+            "file": os.path.basename(fpath), "ansatz": ansatz_name,
+            "num_sites": num_sites, "Jz": jz,
+        }
+
+        # 4. Evaluación MCMC (Energía y Observables locales)
+        energy_stats = vstate.expect(hamiltonian)
+        row["Energy"] = energy_stats.mean.real / num_sites
+        row["Energy_err"] = energy_stats.error_of_mean / num_sites
+
+        sparse_ops = build_sparse_observables(hilbert, graph)
+        for obs_name, op in sparse_ops.items():
+            stats = vstate.expect(op)
+            row[obs_name] = stats.mean.real
+            row[f"{obs_name}_err"] = stats.error_of_mean
+            
+        # Componente total de magnetización
+        row["M_total"] = np.sqrt(row["Mx"]**2 + row["My"]**2 + row["Mz"]**2)
+
+        # 5. Evaluación Densa Exacta (Vector de estado subyacente -> C_l1 y Fidelidad)
+        try:
+            psi_nqs_dense = vstate.to_array()
+            c_l1, fidelity = calculate_dense_metrics(psi_nqs_dense, exact_cache[jz_key]["psi0"])
+            row["Cl1"] = c_l1
+            row["Fidelity"] = fidelity
+            del psi_nqs_dense
+            gc.collect()
+        except Exception as e:
+            print(f"    [WARN] No se pudo proyectar el vector denso para fidelidad: {e}")
+            row["Cl1"], row["Fidelity"] = np.nan, np.nan
+
+        records_nqs.append(row)
+
+    df_nqs = pd.DataFrame(records_nqs).sort_values(by=["ansatz", "Jz"])
+    df_nqs.to_csv(output_csv, index=False)
+    
+    # Formatear el DataFrame de ED para graficación
+    ed_records = []
+    for jz_k, vals in exact_cache.items():
+        r = {"Jz": jz_k, **{k: v for k, v in vals.items() if k != "psi0"}}
+        r["M_total"] = np.sqrt(r.get("Mx",0)**2 + r.get("My",0)**2 + r.get("Mz",0)**2)
+        ed_records.append(r)
+    df_ed = pd.DataFrame(ed_records).sort_values(by="Jz")
+    
+    print(f"\n[SUCCESS] Exportados resultados variacionales a: {output_csv}")
+    return df_nqs, df_ed
+
+# =============================================================================
+# 5. GENERADOR DE GRÁFICOS MULTI-OBSERVABLE
+# =============================================================================
+def plot_all_observables(df_nqs: pd.DataFrame, df_ed: pd.DataFrame, output_dir: str = "plots_tfm"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    config = [
+        ("Energy", "Energía por Sitio $E_0 / N$", "black"),
+        ("M_total", "Magnetización Total $\\langle M_{\\text{tot}} \\rangle$", "tab:orange"),
+        ("Mx", "Magnetización $\\langle M_x \\rangle$", "tab:blue"),
+        ("My", "Magnetización $\\langle M_y \\rangle$", "tab:green"),
+        ("Mz", "Magnetización $\\langle M_z \\rangle$", "tab:red"),
+        ("Szz", "Correlación de Espín $\\langle S^{zz} \\rangle$", "tab:purple"),
+        ("Wp", "Bucle de Wilson $\\langle \\hat{W}_p \\rangle$", "tab:brown"),
+        ("Cl1", "Coherencia Cuántica $C_{l_1}$", "tab:cyan"),
+        ("Fidelity", "Fidelidad Exacta $|\\langle \\Psi_{\\text{ED}} | \\Psi_{\\text{NQS}} \\rangle|^2$", "crimson")
     ]
 
-    layer_vals = sorted(df['layers'].unique())
-    cmap = plt.cm.tab10
+    markers = ['o', 's', '^', 'D', 'v', 'P', '*']
+    ansatz_list = df_nqs["ansatz"].unique()
 
-    os.makedirs("plots", exist_ok=True)
+    for obs_col, ylabel, ed_color in config:
+        if obs_col not in df_nqs.columns: continue
 
-    for obs_col, exact_vals, ylabel, exact_color in observables_config:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(8, 5.5))
 
-        if exact_vals is not None and len(exact_vals) > 0:
-            ax.plot(jz_values_exact, exact_vals, 'o-', color=exact_color, linewidth=2, label='Exacto (ED)', zorder=2)
+        # Línea Teórica Exacta (ED)
+        if obs_col in df_ed.columns and obs_col != "Fidelity":
+            ax.plot(df_ed["Jz"], df_ed[obs_col], 'o--', color=ed_color, 
+                    linewidth=2.0, label="Exacto (ED Lanczos)", zorder=2)
+        elif obs_col == "Fidelity":
+            ax.axhline(1.0, color="black", linestyle="--", linewidth=1.5, label="Límite Teórico Ideal", zorder=2)
 
-        for li, layer in enumerate(layer_vals):
-            sub = df[df['layers'] == layer].sort_values('Jz')
-            if obs_col not in sub.columns or sub[obs_col].isna().all():
-                continue
-            
-            ax.plot(sub['Jz'], sub[obs_col], marker='s', markersize=8, color=cmap(li), label=f'RBM layers={layer}', zorder=5, linestyle='--')
+        # Puntos Variacionales NQS
+        for idx, ansatz_name in enumerate(ansatz_list):
+            sub = df_nqs[df_nqs["ansatz"] == ansatz_name].sort_values("Jz")
+            y_vals = sub[obs_col]
+            y_errs = sub.get(f"{obs_col}_err", np.zeros_like(y_vals))
 
-        ax.set_xlabel('$J_z$', fontsize=13)
-        ax.set_ylabel(ylabel, fontsize=13)
-        ax.set_title(f'{ylabel} vs $J_z$', fontsize=14)
-        ax.legend(fontsize=10)
-        ax.grid(True, linestyle='--', alpha=0.6)
-        plt.tight_layout()
-        
-        fname = f'plots/obs_{obs_col}_vs_jz.png'
-        plt.savefig(fname, dpi=300)
-        plt.close()
-        
-    print("\n[OK] ¡Todos los plots guardados en la carpeta 'plots/'!")
+            ax.errorbar(
+                sub["Jz"], y_vals, yerr=y_errs,
+                marker=markers[idx % len(markers)], markersize=7, capsize=4,
+                linestyle="None", label=f"NQS ({ansatz_name})", zorder=3
+            )
 
+        ax.set_xlabel("Anisotropía de Acoplamiento $J_z / J$", fontweight="bold")
+        ax.set_ylabel(ylabel, fontweight="bold")
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.legend(frameon=True, facecolor="white", edgecolor="none", shadow=True)
+
+        fig.tight_layout()
+        save_png = os.path.join(output_dir, f"obs_{obs_col}_vs_Jz.png")
+        plt.savefig(save_png)
+        plt.close(fig)
+        print(f"[EXPORT] Gráfico exportado: {save_png}")
+
+# =============================================================================
+# 6. ENTRYPOINT
+# =============================================================================
 if __name__ == "__main__":
-    main()
+    print("="*75)
+    print(" PIPELINE DE BENCHMARKING TFM: NQS vs DIAGONALIZACIÓN EXACTA")
+    print("="*75)
+    
+    df_nqs, df_ed = evaluate_all(checkpoint_dir="data/checkpoints", n_samples=16384)
+    plot_all_observables(df_nqs, df_ed, output_dir="plots_tfm")
+    print("\n[COMPLETE] Análisis comparativo multinivel concluido.")

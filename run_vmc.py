@@ -96,6 +96,27 @@ def main(args):
         # ===================================================================
         # ETAPA 2: Entrenamiento CON Proyección (Colapso al sector topológico)
         # ===================================================================
+        #tenemos que acceder a los GS,  
+        data_energy = np.load('data/raw/energies_eigenvecs.npz', allow_pickle=True)
+        exact_results_dict = data_energy['data_dict'].item()
+        
+        # Generar la clave exactamente con el mismo formato numérico (float) 
+        # y precisión (4 decimales) con el que fue guardado en run_exact_diagonalization
+        jz_key = round(float(jz), 4)
+        
+        # Acceder a las contribuciones de las representaciones irreducibles
+        irrep_contributions_dict = exact_results_dict[jz_key]['irrep_contributions']
+        
+        # Identificar la irrep dominante
+        best_irrep_str = max(irrep_contributions_dict, key=irrep_contributions_dict.get)
+        args.irrep = int(best_irrep_str) 
+        max_contribution = irrep_contributions_dict[best_irrep_str]
+        
+        print(f"[ED Info] Para Jz={jz_key}, la irrep dominante es {args.irrep} con peso {max_contribution:.4f}")
+
+        print(f"Física del Estado Fundamental: Para J_z={jz:.1f}, el sector dominante es la Irrep {args.irrep} "
+              f"(Contribución: {max_contribution:.4f}).")
+
         if args.use_symmetry:
             print(f"\n--- ETAPA 2: Con Proyección Irrep {args.irrep} ({args.n_iter_2} iteraciones) ---")
             if args.model == "RBM":
@@ -162,4 +183,4 @@ if __name__ == "__main__":
     parser.add_argument("--use_sr", action="store_true", help="Usar Stochastic Reconfiguration (QNG)")
     
     args = parser.parse_args()
-    main(args)d
+    main(args)
