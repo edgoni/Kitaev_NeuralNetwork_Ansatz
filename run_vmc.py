@@ -3,11 +3,13 @@ import numpy as np
 import netket as nk
 import optax  # Añadimos optax para los schedules
 from pathlib import Path
+import os
 
 # --- Importaciones de tu librería unificada (src) ---
 from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
 from src.physics.symmetries import get_kitaev_symmetries
 from src.physics.observables import get_kitaev_plaquettes, build_wilson_loops
+from src.physics.exact_diag import run_exact_diagonalization, identify_irreps
 from src.models.rbm import ProjectedRBM
 from src.models.factoredSelfAtt import FactoredAttention, QuantumSelfAttention
 from src.training.drivers import setup_vmc_driver
@@ -97,21 +99,24 @@ def main(args):
         # ETAPA 2: Entrenamiento CON Proyección (Colapso al sector topológico)
         # ===================================================================
         #tenemos que acceder a los GS,  
+        if os.path.exists('data/raw/energies_eigenvecs.npz') == False:
+            run_exact_diagonalization(extent=[args.L1, args.L2], jz_steps=args.jz_steps, k_eigenvals=5, save_path='data/raw/energies_eigenvecs.npz', save_debug_json=True)
+                
         data_energy = np.load('data/raw/energies_eigenvecs.npz', allow_pickle=True)
         exact_results_dict = data_energy['data_dict'].item()
-        
+            
         # Generar la clave exactamente con el mismo formato numérico (float) 
         # y precisión (4 decimales) con el que fue guardado en run_exact_diagonalization
         jz_key = round(float(jz), 4)
-        
+            
         # Acceder a las contribuciones de las representaciones irreducibles
         irrep_contributions_dict = exact_results_dict[jz_key]['irrep_contributions']
-        
+            
         # Identificar la irrep dominante
         best_irrep_str = max(irrep_contributions_dict, key=irrep_contributions_dict.get)
         args.irrep = int(best_irrep_str) 
         max_contribution = irrep_contributions_dict[best_irrep_str]
-        
+            
         print(f"[ED Info] Para Jz={jz_key}, la irrep dominante es {args.irrep} con peso {max_contribution:.4f}")
 
         print(f"Física del Estado Fundamental: Para J_z={jz:.1f}, el sector dominante es la Irrep {args.irrep} "
