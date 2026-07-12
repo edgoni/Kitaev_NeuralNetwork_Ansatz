@@ -38,6 +38,10 @@ import flax.serialization
 import netket as nk
 from netket.operator.spin import sigmax, sigmay, sigmaz
 
+from src.physics.observables import build_sparse_observables, calculate_dense_metrics
+from src.models.rbm import ProjectedRBM
+from src.models.factoredSelfAtt import QuantumSelfAttention
+
 # Importaciones del repositorio (física y modelos)
 try:
     from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
@@ -85,7 +89,7 @@ def get_model_instance(ansatz_name: str = "QuantumSelf"):
         return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
     elif "FACTORED" in ansatz_upper:
         return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
-    return RBM(alpha=2, param_dtype=jnp.complex128)
+    return ProjectedRBM(alpha=2, param_dtype=jnp.complex128)
 
 # =============================================================================
 # 4. MOTOR DE EVALUACIÓN GLOBAL (MCMC + EXACT VECTOR)
@@ -123,7 +127,6 @@ def evaluate_all(
         
         # 2. Cargar solución Exacta (ED) para este Jz en caché
         jz_key = round(jz, 3)
-        run_exact_diagonalization(extent=[3,3], jz_steps=11, k_eigenvals=1, save_path='data/raw/energies_eigenvecs.npz')
         jz_eigval_eigvec = load_exact_results('data/raw/energies_eigenvecs.npz')
         if jz_key not in exact_cache:
             print(f"    [ED] Calculando Diagonalización Exacta de referencia para Jz={jz:.2f}...")
