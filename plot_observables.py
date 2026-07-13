@@ -27,6 +27,7 @@ import pickle
 import warnings
 from collections import defaultdict
 from typing import List, Tuple, Dict
+import msgpack
 
 import numpy as np
 import pandas as pd
@@ -86,10 +87,10 @@ def parse_mpack_filename(filepath: str):
 def get_model_instance(ansatz_name: str = "QuantumSelf"):
     ansatz_upper = ansatz_name.upper()
     if "TRANSFORMER" in ansatz_upper or "SELFATT" in ansatz_upper:
-        return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
+        return QuantumSelfAttention(num_layers=2, num_heads=4, param_dtype=jnp.complex128)
     elif "FACTORED" in ansatz_upper:
-        return QuantumSelfAttention(num_layers=4, num_heads=4, param_dtype=jnp.complex128)
-    return ProjectedRBM(alpha=2, param_dtype=jnp.complex128)
+        return QuantumSelfAttention(num_layers=2, num_heads=4, param_dtype=jnp.complex128)
+    return ProjectedRBM(alpha=1, param_dtype=jnp.complex128)
 
 # =============================================================================
 # 4. MOTOR DE EVALUACIÓN GLOBAL (MCMC + EXACT VECTOR)
@@ -148,9 +149,24 @@ def evaluate_all(
         sampler = nk.sampler.MetropolisExchange(hilbert, graph=graph, d_max=2, n_chains=16)
         vstate = nk.vqs.MCState(sampler, model, n_samples=n_samples)
 
-        with open(fpath, "rb") as file_handle:
-            state_dict = flax.serialization.from_bytes(vstate.variables, file_handle.read())
-            vstate.variables = state_dict
+                # Inspeccionamos las claves del archivo guardado
+        with open(fpath, "rb") as f:
+            datos_mpack = msgpack.unpack(f)
+            print("[DEBUG] Claves en el archivo mpack:", datos_mpack.keys())
+
+            # Cargar los pesos crudos desde el archivo mpack
+        with open(fpath, 'rb') as f:
+            # Usamos flax.serialization.msgpack_restore para leerlo como dict de JAX
+            raw_state = flax.serialization.msgpack_restore(f.read())
+
+        # Ajustamos la estructura: envolver los pesos en un diccionario con la clave 'params'
+        state_dict_adjusted = {'params': raw_state}
+
+        # Ahora aplicamos la restauración usando el diccionario ajustado
+        state_dict = flax.serialization.from_state_dict(vstate.variables, state_dict_adjusted)
+
+        # Asignamos los parámetros al estado variacional
+        vstate.variables = state_dict
 
         row = {
             "file": os.path.basename(fpath), "ansatz": ansatz_name,
@@ -167,7 +183,16 @@ def evaluate_all(
             stats = vstate.expect(op)
             row[obs_name] = stats.mean.real
             row[f"{obs_name}_err"] = stats.error_of_mean
-            
+        
+
+        # Inspeccionamos las claves del archivo guardado
+        with open(fpath, "rb") as f:
+            datos_mpack = msgpack.unpack(f)
+            print("[DEBUG] Claves en el archivo mpack:", datos_mpack.keys())
+
+        # Si el archivo tiene una estructura anidada, extrae solo la rama 'variables'
+        # Si es un guardado directo de Flax, asegúrate de que el modelo coincida.
+
         # Componente total de magnetización
         row["M_total"] = np.sqrt(row["Mx"]**2 + row["My"]**2 + row["Mz"]**2)
 

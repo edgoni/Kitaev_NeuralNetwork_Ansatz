@@ -4,6 +4,7 @@ import netket as nk
 import optax  # Añadimos optax para los schedules
 from pathlib import Path
 import os
+import jax.numpy as jnp 
 
 # --- Importaciones de tu librería unificada (src) ---
 from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
@@ -111,6 +112,7 @@ def main(args):
             
         # Acceder a las contribuciones de las representaciones irreducibles
         irrep_contributions_dict = exact_results_dict[jz_key]['irrep_contributions']
+        psi_exact = exact_results_dict[jz_key]['psi0']
             
         # Identificar la irrep dominante
         best_irrep_str = max(irrep_contributions_dict, key=irrep_contributions_dict.get)
@@ -139,13 +141,57 @@ def main(args):
             # --- SCHEDULE DE LEARNING RATE PARA ETAPA 2 ---
             # Arranca donde terminó la Etapa 1 y decae hasta un valor residual (ej: 1% del inicial)
             # Esto evita que el QNG / SR destruya los pesos de la primera etapa y solo afine.
+            '''
             lr_schedule_s2 = optax.linear_schedule(
                 init_value=args.learning_rate * 0.1,
                 end_value=args.learning_rate * 0.01, 
                 transition_steps=args.n_iter_2
             )
+            '''
+            
+            lr_phase2 = optax.join_schedules(
+            schedules=[
+                optax.constant_schedule(2e-2),   # épocas 0-500: exploración
+                optax.constant_schedule(1e-2),   # épocas 500-1200: convergencia
+                optax.constant_schedule(5e-3),   # épocas 1200-2000: refinamiento
+                optax.constant_schedule(1e-3),   # épocas 2000-3500: ajuste fino
+            ],
+            boundaries=[ args.n_iter_2 * 0.2, args.n_iter_2 * 0.5, args.n_iter_2 * 0.7]
+        )
+            optimizer2 = nk.optimizer.Adam(learning_rate=lr_phase2)
+        
+            diag_schedule2 = optax.join_schedules(
+                schedules=[
+                    optax.constant_schedule(0.1),
+                    optax.constant_schedule(0.01),
+                    optax.constant_schedule(1e-3),
+                    optax.constant_schedule(1e-4),
+                ],
+                boundaries=[200, 800, 2000]
+            )
+            sr2 = nk.optimizer.SR(diag_shift=diag_schedule2, holomorphic=False)
 
-            driver_s2 = setup_vmc_driver(vstate_s2, H, learning_rate=lr_schedule_s2, use_sr=args.use_sr)
+            #FOR INFIDELITY##
+            target_model = nk.models.LogStateVector(hilbert)
+
+            vs_target = nk.vqs.MCState(sampler, target_model, n_samples=args.n_samples)
+            epsilon = 1e-12
+            psi_exact_flat = jnp.array(psi_exact.flatten())
+            log_amplitudes = jnp.log(psi_exact_flat + epsilon + 0.0j)
+
+            vs_target.variables = {"params": {"logstate": log_amplitudes}}
+
+
+            #driver_s2 = setup_vmc_driver(vstate_s2, H, learning_rate=lr_phase2, use_sr=args.use_sr)
+
+            driver_s2 = nk.experimental.driver.Infidelity_SR(
+            target_state=vs_target,
+            optimizer=optimizer2,
+            diag_shift=diag_schedule2,
+            variational_state=vstate_s2,
+            operator=None,
+        )
+
             
             metrics_s2 = {'step': [], 'energy': [], 'energy_error': [], 'variance': [], 'wp_mean': []}
             ckpt_path_s2 = Path(f"data/checkpoints/{args.exp_name}_Jz{jz:.2f}_Stage2.mpack")
@@ -175,14 +221,14 @@ if __name__ == "__main__":
     parser.add_argument("--use_symmetry", action="store_true", help="Activar la proyección de simetría espacial")
     
     # Hiperparámetros
-    parser.add_argument("--alpha", type=float, default=1.0, help="Densidad RBM")
+    parser.add_argument("--alpha", type=float, default=2.0, help="Densidad RBM")
     parser.add_argument("--layers", type=int, default=2, help="Capas del Transformer")
     parser.add_argument("--heads", type=int, default=4, help="Cabezales del Transformer")
     
     # MCMC y Entrenamiento
     parser.add_argument("--n_samples", type=int, default=2048)
-    parser.add_argument("--n_iter_1", type=int, default=300)
-    parser.add_argument("--n_iter_2", type=int, default=300)
+    parser.add_argument("--n_iter_1", type=int, default=500)
+    parser.add_argument("--n_iter_2", type=int, default=2000)
     parser.add_argument("--n_chains", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--use_sr", action="store_true", help="Usar Stochastic Reconfiguration (QNG)")
