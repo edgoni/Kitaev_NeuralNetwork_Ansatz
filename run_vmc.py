@@ -11,10 +11,12 @@ from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
 from src.physics.symmetries import get_kitaev_symmetries
 from src.physics.observables import get_kitaev_plaquettes, build_wilson_loops
 from src.physics.exact_diag import run_exact_diagonalization, identify_irreps
-from src.models.rbm import ProjectedRBM
+from src.models.rbm import ProjectedRBM, DeepRBMSymmProj
 from src.models.factoredSelfAtt import FactoredAttention, QuantumSelfAttention
 from src.training.drivers import setup_vmc_driver
 from src.training.callbacks import BestEnergyCheckpoint, build_observables_logger
+
+from src.training.callbacks import BestIterKeeper, BestOverlapKeeper, make_extract_metrics, make_extract_metrics_plaquete
 
 def main(args):
     print(f"--- Iniciando VMC Pipeline 2-ETAPAS: Modelo={args.model}, Extent={args.L1}x{args.L2} ---")
@@ -63,12 +65,13 @@ def main(args):
             Jx=jx, Jy=jy, Jz=jz, h=0.0, hi=hilbert
         )
 
+
         # ===================================================================
         # ETAPA 1: Entrenamiento SIN Proyección (Warm-up general)
         # ===================================================================
         print(f"\n--- ETAPA 1: Sin Proyección (Warm-up {args.n_iter_1} iteraciones) ---")
         if args.model == "RBM":
-            model_stage1 = ProjectedRBM(alpha=args.alpha, symmetries=None, characters=None)
+            model_stage1 = DeepRBMSymmProj(alpha=args.alpha, symmetries=None, characters=None)
         elif args.model == "Transformer":
             model_stage1 = QuantumSelfAttention(layers=args.layers, heads=args.heads, symmetries=None, characters=None)
             
@@ -80,18 +83,22 @@ def main(args):
 
         # --- SCHEDULE DE LEARNING RATE PARA ETAPA 1 ---
         # Decae linealmente desde el LR inicial hasta un 10% del mismo
-        lr_schedule_s1 = optax.linear_schedule(
-            init_value=args.learning_rate,
-            end_value=args.learning_rate * 0.1,
-            transition_steps=args.n_iter_1
+        lr_schedule_s1 = optax.warmup_exponential_decay_schedule(
+            init_value=0.01, # bajamos el learning rate para lowlr:1e-3
+            peak_value=0.05,
+            warmup_steps=30,
+            transition_steps=100,
+            decay_rate=0.95
         )
+        sr1 = nk.optimizer.SR(diag_shift=0.01, holomorphic=False)
+        optimizer1 = nk.optimizer.Adam(learning_rate=lr_schedule_s1)
 
-        driver_s1 = setup_vmc_driver(vstate_s1, H, learning_rate=lr_schedule_s1, use_sr=args.use_sr)
+        driver_s1 = nk.driver.VMC(H, optimizer1, variational_state=vstate_s1, preconditioner=sr1)
         
         metrics_s1 = {'step': [], 'energy': [], 'energy_error': [], 'variance': [], 'wp_mean': []}
         ckpt_path_s1 = Path(f"data/checkpoints/{args.exp_name}_Jz{jz:.2f}_Stage1.mpack")
-        checkpoint_s1 = BestEnergyCheckpoint(H, save_path=ckpt_path_s1)
-        logger_s1 = build_observables_logger(metrics_s1, H, wp_operators=Wp_list)
+        checkpoint_s1 = BestEnergyCheckpoint(H, save_path = ckpt_path_s1)
+        logger_s1 = build_observables_logger(metrics_s1, H, wp_operators = Wp_list)
         tb_logger_s1 = nk.logging.TensorBoardLog(f"data/tb_logs/{args.exp_name}_Jz{jz:.2f}_Stage1")
 
         driver_s1.run(n_iter=args.n_iter_1, out=tb_logger_s1, callback=[checkpoint_s1, logger_s1], show_progress=True)
@@ -127,7 +134,7 @@ def main(args):
         if args.use_symmetry:
             print(f"\n--- ETAPA 2: Con Proyección Irrep {args.irrep} ({args.n_iter_2} iteraciones) ---")
             if args.model == "RBM":
-                model_stage2 = ProjectedRBM(alpha=args.alpha, symmetries=symm_tuple, characters=char_tuple)
+                model_stage2 = DeepRBMSymmProj(alpha=args.alpha, symmetries=symm_tuple, characters=char_tuple)
             elif args.model == "Transformer":
                 model_stage2 = QuantumSelfAttention(layers=args.layers, heads=args.heads, symmetries=symm_tuple, characters=char_tuple)
                 
@@ -150,14 +157,14 @@ def main(args):
             '''
             
             lr_phase2 = optax.join_schedules(
-            schedules=[
-                optax.constant_schedule(2e-2),   # épocas 0-500: exploración
-                optax.constant_schedule(1e-2),   # épocas 500-1200: convergencia
-                optax.constant_schedule(5e-3),   # épocas 1200-2000: refinamiento
-                optax.constant_schedule(1e-3),   # épocas 2000-3500: ajuste fino
-            ],
-            boundaries=[ args.n_iter_2 * 0.2, args.n_iter_2 * 0.5, args.n_iter_2 * 0.7]
-        )
+                schedules=[
+                    optax.constant_schedule(2e-2),   # épocas 0-500: exploración
+                    optax.constant_schedule(1e-2),   # épocas 500-1200: convergencia
+                    optax.constant_schedule(5e-3),   # épocas 1200-2000: refinamiento
+                    optax.constant_schedule(1e-3),   # épocas 2000-3500: ajuste fino
+                ],
+                boundaries=[ args.n_iter_2 * 0.2, args.n_iter_2 * 0.5, args.n_iter_2 * 0.7]
+            )
             optimizer2 = nk.optimizer.Adam(learning_rate=lr_phase2)
         
             diag_schedule2 = optax.join_schedules(
@@ -195,11 +202,11 @@ def main(args):
             
             metrics_s2 = {'step': [], 'energy': [], 'energy_error': [], 'variance': [], 'wp_mean': []}
             ckpt_path_s2 = Path(f"data/checkpoints/{args.exp_name}_Jz{jz:.2f}_Stage2.mpack")
-            checkpoint_s2 = BestEnergyCheckpoint(H, save_path=ckpt_path_s2)
+            checkpoint_s2 =BestOverlapKeeper(H, N, 1e-8, stop_variance=True, filename=ckpt_path_s2)
             logger_s2 = build_observables_logger(metrics_s2, H, wp_operators=Wp_list)
             tb_logger_s2 = nk.logging.TensorBoardLog(f"data/tb_logs/{args.exp_name}_Jz{jz:.2f}_Stage2")
 
-            driver_s2.run(n_iter=args.n_iter_2, out=tb_logger_s2, callback=[checkpoint_s2, logger_s2], show_progress=True)
+            driver_s2.run(n_iter=args.n_iter_2, out=tb_logger_s2, callback=[checkpoint_s2.update, logger_s2], show_progress=True)
             
             transfer_params = checkpoint_s2.best_state_params if checkpoint_s2.best_state_params is not None else vstate_s2.parameters
         else:
@@ -227,8 +234,8 @@ if __name__ == "__main__":
     
     # MCMC y Entrenamiento
     parser.add_argument("--n_samples", type=int, default=2048)
-    parser.add_argument("--n_iter_1", type=int, default=500)
-    parser.add_argument("--n_iter_2", type=int, default=2000)
+    parser.add_argument("--n_iter_1", type=int, default=1)
+    parser.add_argument("--n_iter_2", type=int, default=1)
     parser.add_argument("--n_chains", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=0.01)
     parser.add_argument("--use_sr", action="store_true", help="Usar Stochastic Reconfiguration (QNG)")

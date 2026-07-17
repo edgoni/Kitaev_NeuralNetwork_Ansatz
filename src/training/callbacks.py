@@ -4,6 +4,7 @@ import numpy as np
 import jax.numpy as jnp
 from typing import Optional, Dict, List, Any
 import pathlib
+import numpy.typing as npt
 
 class BestEnergyCheckpoint:
     """
@@ -98,6 +99,193 @@ def build_observables_logger(metrics_history: Dict[str, List],
 
         # Imprimir en consola de forma limpia
         print(log_msg)
+        return True
+
+    return extract_metrics
+
+
+class BestIterKeeper:
+    """Almacena los valores de varias cantidades de la mejor iteración.
+
+    "Mejor" se define en el sentido de menor energía.
+
+    Argumentos:
+        Hamiltoniano: Un array que contiene la matriz del Hamiltoniano.
+        N: Número de espines en la cadena.
+        baseline: Un límite inferior para la puntuación V. Si la puntuación V
+            de la mejor iteración cae por debajo de este umbral, el proceso
+            se detendrá antes.
+        filename: Puede ser None o un archivo donde se escribirá el mejor estado.
+    """
+
+    def __init__(
+        self,
+        Hamiltonian: npt.ArrayLike,
+        N: int,
+        baseline: float,
+        filename: Optional[pathlib.Path] = None,
+        stop_variance: bool = False
+    ):
+        self.Hamiltonian = Hamiltonian
+        self.N = N
+        self.baseline = baseline
+        self.filename = filename
+        self.stop_variance = stop_variance
+        self.vscore = np.inf
+        self.best_energy = np.inf
+        self.best_state = None
+
+    def update(self, step, log_data, driver):
+        """Actualiza las cantidades almacenadas si es necesario.
+
+        Esta función está diseñada para actuar como una función de *callback* para NetKet.
+        Por favor, consulta la documentación de su API para una explicación detallada.
+        """
+
+        vstate = driver.state
+        energystep = np.real(vstate.expect(self.Hamiltonian).mean)
+        var = np.real(getattr(log_data[driver._loss_name], "variance"))
+        mean = np.real(getattr(log_data[driver._loss_name], "mean"))
+        varstep = self.N * var / mean**2
+
+        if self.best_energy > energystep:
+            self.best_energy = energystep
+            self.best_state = copy.copy(driver.state)
+            self.best_state.parameters = flax.core.copy(
+                driver.state.parameters
+            )
+            self.vscore = varstep
+
+            if self.filename != None:
+                with open(self.filename, "wb") as file:
+                    file.write(flax.serialization.to_bytes(driver.state))
+        if self.stop_variance==True:
+           return True
+        else:
+            return self.vscore > self.baseline
+        
+
+class BestOverlapKeeper:
+    """Almacena los valores de varias cantidades de la mejor iteración.
+
+    "Mejor" se define en el sentido de menor energía.
+
+    Argumentos:
+        Hamiltoniano: Un array que contiene la matriz del Hamiltoniano.
+        N: Número de espines en la cadena.
+        baseline: Un límite inferior para la puntuación V. Si la puntuación V
+            de la mejor iteración cae por debajo de este umbral, el proceso
+            se detendrá antes.
+        filename: Puede ser None o un archivo donde se escribirá el mejor estado.
+    """
+
+    def __init__(
+        self,
+        Hamiltonian: npt.ArrayLike,
+        N: int,
+        baseline: float,
+        filename: Optional[pathlib.Path] = None,
+        stop_variance: bool = False
+    ):
+        self.Hamiltonian = Hamiltonian
+        self.N = N
+        self.baseline = baseline
+        self.filename = filename
+        self.stop_variance = stop_variance
+        self.vscore = np.inf
+        self.best_energy = np.inf
+        self.best_state = None
+        self.best_infid = np.inf
+
+    def update(self, step, log_data, driver):
+        """Actualiza las cantidades almacenadas si es necesario.
+
+        Esta función está diseñada para actuar como una función de *callback* para NetKet.
+        Por favor, consulta la documentación de su API para una explicación detallada.
+        """
+
+        vstate = driver.state
+        energystep = np.real(vstate.expect(self.Hamiltonian).mean)
+        var = np.real(getattr(log_data[driver._loss_name], "variance"))
+        mean = np.real(getattr(log_data[driver._loss_name], "mean"))
+        infidelity = np.inf
+        if log_data['Infidelity'] is not None:
+            infidelity = float(jnp.real(log_data['Infidelity'].mean))
+        varstep = self.N * var / mean**2
+        
+        if self.best_infid > infidelity:
+            self.best_infid = infidelity
+            self.best_state = copy.copy(driver.state)
+            self.best_state.parameters = flax.core.copy(
+                driver.state.parameters
+            )
+            self.vscore = varstep
+
+            if self.filename != None:
+                with open(self.filename, "wb") as file:
+                    file.write(flax.serialization.to_bytes(driver.state))
+        if self.stop_variance==True:
+           return True
+        else:
+            return self.vscore > self.baseline
+        
+def make_extract_metrics(metrics_history, H):
+  '''
+  Function that extractus some metrics from the training proccess of the NQS.
+  Please refer to NetKet documentation to learn more about the structure of this type of function.
+  '''
+  def extract_metrics(step, log_data, driver):
+      stats = driver.state.expect(H)
+      energy = float(jnp.real(stats.mean))
+      energy_error = float(jnp.real(stats.error_of_mean))
+
+      loss = float(jnp.real(getattr(log_data[driver._loss_name], "mean")))
+      variance = float(jnp.real(getattr(log_data[driver._loss_name], "variance")))
+
+      metrics_history['step'].append(step)
+      metrics_history['energy'].append(energy)
+      metrics_history['energy_error'].append(energy_error)
+      #metrics_history['loss'].append(loss)
+      metrics_history['variance'].append(variance)
+
+      print(f"Step {step}: Energy = {energy:.6f} ± {energy_error:.2e}, Variance = {variance:.4f}")
+      return True
+
+  return extract_metrics
+
+
+def make_extract_metrics_plaquete(metrics_history, H, Wp_op=None):
+    def extract_metrics(step, log_data, driver):
+        if log_data['Infidelity'] is not None:
+            infidelity = float(jnp.real(log_data['Infidelity'].mean))
+            metrics_history['infidelity'].append(infidelity)
+        stats = log_data.get("_cached_energy_stats", None)
+        if stats is None:
+            stats = driver.state.expect(H)
+
+        energy       = float(jnp.real(stats.mean))
+        energy_error = float(jnp.real(stats.error_of_mean))
+        variance     = float(jnp.real(getattr(log_data[driver._loss_name], "variance")))
+
+        # --- CAMBIO AQUÍ: Calculamos cada Wp individualmente ---
+        wp_values = [float(np.real(driver.state.expect(op).mean)) for op in Wp_op]
+        wp_mean = np.mean(wp_values)
+
+        # Guardar en el historial
+        metrics_history['step'].append(step)
+        metrics_history['energy'].append(energy)
+        metrics_history['energy_error'].append(energy_error)
+        metrics_history['variance'].append(variance)
+        metrics_history['wp_mean'].append(wp_mean)
+
+        # Guardamos cada plaqueta con una llave dinámica: Wp_0, Wp_1, ...
+        for idx, val in enumerate(wp_values):
+            key = f'Wp_{idx}'
+            if key not in metrics_history:
+                metrics_history[key] = []
+            metrics_history[key].append(val)
+
+        print(f"Step {step:4d} | E = {energy:.6f} | Wp_avg = {wp_mean:.4f}")
         return True
 
     return extract_metrics
