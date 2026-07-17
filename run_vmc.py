@@ -1,10 +1,11 @@
 import argparse
 import numpy as np
 import netket as nk
-import optax  # Añadimos optax para los schedules
+import optax  # Añadimos optax para los scddedules
 from pathlib import Path
 import os
 import jax.numpy as jnp 
+from netket.utils import HashableArray
 
 # --- Importaciones de tu librería unificada (src) ---
 from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
@@ -34,10 +35,7 @@ def main(args):
     space_group = symmetries_info["space_group"]
     
     perms = np.array(graph.automorphisms())
-    chars = np.array(space_group.character_table()[args.irrep])
-
-    symm_tuple = tuple(map(tuple, perms.tolist()))
-    char_tuple = tuple(chars.tolist())
+    symm_tuple = HashableArray(perms)
     
     # 4. MCMC Sampler 
     rule1 = nk.sampler.rules.LocalRule()
@@ -124,6 +122,10 @@ def main(args):
         # Identificar la irrep dominante
         best_irrep_str = max(irrep_contributions_dict, key=irrep_contributions_dict.get)
         args.irrep = int(best_irrep_str) 
+
+        #!cambio calculamos aqui los caracteres a los que proyectar
+        chars = np.array(space_group.character_table()[args.irrep])
+        char_tuple = HashableArray(chars)
         max_contribution = irrep_contributions_dict[best_irrep_str]
             
         print(f"[ED Info] Para Jz={jz_key}, la irrep dominante es {args.irrep} con peso {max_contribution:.4f}")
@@ -139,7 +141,7 @@ def main(args):
                 model_stage2 = QuantumSelfAttention(layers=args.layers, heads=args.heads, symmetries=symm_tuple, characters=char_tuple)
                 
             vstate_s2 = nk.vqs.MCState(sampler, model_stage2, n_samples=args.n_samples)
-            vstate_s2.chunk_size = 128
+            #vstate_s2.chunk_size = 128
             
             # Transferencia de pesos
             best_s1_params = checkpoint_s1.best_state_params if checkpoint_s1.best_state_params is not None else vstate_s1.parameters
@@ -148,13 +150,7 @@ def main(args):
             # --- SCHEDULE DE LEARNING RATE PARA ETAPA 2 ---
             # Arranca donde terminó la Etapa 1 y decae hasta un valor residual (ej: 1% del inicial)
             # Esto evita que el QNG / SR destruya los pesos de la primera etapa y solo afine.
-            '''
-            lr_schedule_s2 = optax.linear_schedule(
-                init_value=args.learning_rate * 0.1,
-                end_value=args.learning_rate * 0.01, 
-                transition_steps=args.n_iter_2
-            )
-            '''
+
             
             lr_phase2 = optax.join_schedules(
                 schedules=[
@@ -182,13 +178,8 @@ def main(args):
             target_model = nk.models.LogStateVector(hilbert)
 
             vs_target = nk.vqs.MCState(sampler, target_model, n_samples=args.n_samples)
-            epsilon = 1e-12
-            psi_exact_flat = jnp.array(psi_exact.flatten())
-            log_amplitudes = jnp.log(psi_exact_flat + epsilon + 0.0j)
-
-            vs_target.variables = {"params": {"logstate": log_amplitudes}}
-
-
+            vs_target.variables = {"params": {"logstate": jnp.log(psi_exact.flatten() + 1e-12 + 0j)}}
+            
             #driver_s2 = setup_vmc_driver(vstate_s2, H, learning_rate=lr_phase2, use_sr=args.use_sr)
 
             driver_s2 = nk.experimental.driver.Infidelity_SR(
@@ -208,7 +199,7 @@ def main(args):
 
             driver_s2.run(n_iter=args.n_iter_2, out=tb_logger_s2, callback=[checkpoint_s2.update, logger_s2], show_progress=True)
             
-            transfer_params = checkpoint_s2.best_state_params if checkpoint_s2.best_state_params is not None else vstate_s2.parameters
+            transfer_params = checkpoint_s2.bests_state.parameters if checkpoint_s2.bests_state.parameters is not None else vstate_s2.parameters
         else:
             print("\n--- (Saltando Etapa 2 porque --use_symmetry no está activado) ---")
             transfer_params = checkpoint_s1.best_state_params if checkpoint_s1.best_state_params is not None else vstate_s1.parameters
