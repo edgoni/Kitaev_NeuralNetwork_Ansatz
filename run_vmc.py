@@ -1,7 +1,7 @@
 import argparse
 import numpy as np
 import netket as nk
-import optax  # Añadimos optax para los scddedules
+import optax  # Añadimos optax para los schedules
 from pathlib import Path
 import os
 import jax.numpy as jnp 
@@ -12,7 +12,7 @@ from src.physics.hamiltonian import build_kitaev_lattice, KitaevTransverse_H
 from src.physics.symmetries import get_kitaev_symmetries
 from src.physics.observables import get_kitaev_plaquettes, build_wilson_loops
 from src.physics.exact_diag import run_exact_diagonalization, identify_irreps
-from src.models.rbm import ProjectedRBM, DeepRBMSymmProj
+from src.models.rbm import ProjectedRBM, DeepRBMSymmProj, DeepRBM
 from src.models.factoredSelfAtt import FactoredAttention, QuantumSelfAttention
 from src.training.drivers import setup_vmc_driver
 from src.training.callbacks import BestEnergyCheckpoint, build_observables_logger
@@ -69,7 +69,7 @@ def main(args):
         # ===================================================================
         print(f"\n--- ETAPA 1: Sin Proyección (Warm-up {args.n_iter_1} iteraciones) ---")
         if args.model == "RBM":
-            model_stage1 = DeepRBMSymmProj(alpha=args.alpha, symmetries=None, characters=None)
+            model_stage1 = DeepRBM(num_layers = 2, alpha=2.0, param_dtype=jnp.complex128)
         elif args.model == "Transformer":
             model_stage1 = QuantumSelfAttention(layers=args.layers, heads=args.heads, symmetries=None, characters=None)
             
@@ -159,7 +159,7 @@ def main(args):
                     optax.constant_schedule(5e-3),   # épocas 1200-2000: refinamiento
                     optax.constant_schedule(1e-3),   # épocas 2000-3500: ajuste fino
                 ],
-                boundaries=[ args.n_iter_2 * 0.2, args.n_iter_2 * 0.5, args.n_iter_2 * 0.7]
+                boundaries=[ int(args.n_iter_2 * 0.2), int(args.n_iter_2 * 0.5), int(args.n_iter_2 * 0.7)]
             )
             optimizer2 = nk.optimizer.Adam(learning_rate=lr_phase2)
         
