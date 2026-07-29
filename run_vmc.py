@@ -19,6 +19,9 @@ from src.training.callbacks import BestEnergyCheckpoint, build_observables_logge
 
 from src.training.callbacks import BestIterKeeper, BestOverlapKeeper, make_extract_metrics, make_extract_metrics_plaquete
 
+import jax
+jax.config.update("jax_debug_nans", True)
+
 def main(args):
     print(f"--- Iniciando VMC Pipeline 2-ETAPAS: Modelo={args.model}, Extent={args.L1}x{args.L2} ---")
     
@@ -73,7 +76,7 @@ def main(args):
             model_stage1 = QuantumSelfAttention(layers=args.layers, heads=args.heads, symmetries=None, characters=None)
             
         vstate_s1 = nk.vqs.MCState(sampler, model_stage1, n_samples=args.n_samples)
-        vstate_s1.chunk_size = 128
+        #vstate_s1.chunk_size = 128
         
         if transfer_params is not None:
             vstate_s1.parameters = transfer_params
@@ -196,7 +199,9 @@ def main(args):
             checkpoint_s2 =BestOverlapKeeper(H, N, 1e-8, stop_variance=True, filename=ckpt_path_s2)
             logger_s2 = build_observables_logger(metrics_s2, H, wp_operators=Wp_list)
             tb_logger_s2 = nk.logging.TensorBoardLog(f"data/tb_logs/{args.exp_name}_Jz{jz:.2f}_Stage2")
-
+            ###
+            vstate_s2.log_value(vstate_s2.samples)
+            ###
             driver_s2.run(n_iter=args.n_iter_2, out=tb_logger_s2, callback=[checkpoint_s2.update, logger_s2], show_progress=True)
             
             transfer_params = checkpoint_s2.bests_state.parameters if checkpoint_s2.bests_state.parameters is not None else vstate_s2.parameters
