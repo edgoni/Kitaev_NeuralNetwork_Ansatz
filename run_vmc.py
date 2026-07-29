@@ -43,7 +43,6 @@ def main(args):
     sampler = nk.sampler.MetropolisSampler(
         hilbert, 
         rule=nk.sampler.rules.MultipleRules([rule1, rule2], [0.9, 0.1]),
-        n_chains=args.n_chains
     )
 
     jz_values = np.linspace(args.jz_start, args.jz_end, args.jz_steps)
@@ -95,11 +94,12 @@ def main(args):
         
         metrics_s1 = {'step': [], 'energy': [], 'energy_error': [], 'variance': [], 'wp_mean': []}
         ckpt_path_s1 = Path(f"data/checkpoints/{args.exp_name}_Jz{jz:.2f}_Stage1.mpack")
-        checkpoint_s1 = BestEnergyCheckpoint(H, save_path = ckpt_path_s1)
+        
+        checkpoint_s1 = BestIterKeeper(H, N, 1e-8)
         logger_s1 = build_observables_logger(metrics_s1, H, wp_operators = Wp_list)
         tb_logger_s1 = nk.logging.TensorBoardLog(f"data/tb_logs/{args.exp_name}_Jz{jz:.2f}_Stage1")
 
-        driver_s1.run(n_iter=args.n_iter_1, out=tb_logger_s1, callback=[checkpoint_s1, logger_s1], show_progress=True)
+        driver_s1.run(n_iter=args.n_iter_1, out=tb_logger_s1, callback=[checkpoint_s1.update, logger_s1], show_progress=True)
         
         # ===================================================================
         # ETAPA 2: Entrenamiento CON Proyección (Colapso al sector topológico)
@@ -144,8 +144,8 @@ def main(args):
             #vstate_s2.chunk_size = 128
             
             # Transferencia de pesos
-            best_s1_params = checkpoint_s1.best_state_params if checkpoint_s1.best_state_params is not None else vstate_s1.parameters
-            vstate_s2.parameters = best_s1_params
+            best_s1_params = checkpoint_s1.best_state if checkpoint_s1.best_state is not None else vstate_s1.parameters
+            vstate_s2.variables = best_s1_params.variables
 
             # --- SCHEDULE DE LEARNING RATE PARA ETAPA 2 ---
             # Arranca donde terminó la Etapa 1 y decae hasta un valor residual (ej: 1% del inicial)

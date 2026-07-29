@@ -38,16 +38,21 @@ def run_exact_diagonalization(
     for jz in jz_values:
         jx = jy = (1.0 - jz) / 2.0
         H = KitaevTransverse_H(graph.edge_colors, graph.edges(), Jx=jx, Jy=jy, Jz=jz, h=0, hi=hilbert)
+
         eigenvals, eigenvecs = nk.exact.lanczos_ed(H, k=k_eigenvals, compute_eigenvectors=True)
-        
+
+        # Mantenemos el cálculo de irreps para el estado absoluto (o puedes iterarlo después)
         irrep_contributions = identify_irreps(eigenvecs[:, 0], hilbert, graph.automorphisms(), graph.space_group().character_table())
-        # Clave numérica redondeada para evitar errores de flotantes
+
         jz_key = round(float(jz), 4)
+
         exact_results[jz_key] = {
             'E0': float(eigenvals[0].real),
-            'psi0': eigenvecs[:, 0],
+            'energies': eigenvals.real,      # NUEVO: Array con los k autovalores
+            'eigenvectors': eigenvecs,       # NUEVO: Matriz con los k autovectores
             'irrep_contributions': irrep_contributions
         }
+
 
         json_debug_results[jz_key] = {
             'E0': float(eigenvals[0].real),
