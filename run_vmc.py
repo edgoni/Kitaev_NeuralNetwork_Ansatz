@@ -20,7 +20,6 @@ from src.training.callbacks import BestEnergyCheckpoint, build_observables_logge
 from src.training.callbacks import BestIterKeeper, BestOverlapKeeper, make_extract_metrics, make_extract_metrics_plaquete
 
 import jax
-jax.config.update("jax_debug_nans", True)
 
 def main(args):
     print(f"--- Iniciando VMC Pipeline 2-ETAPAS: Modelo={args.model}, Extent={args.L1}x{args.L2} ---")
