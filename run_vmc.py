@@ -120,7 +120,7 @@ def main(args):
             
         # Acceder a las contribuciones de las representaciones irreducibles
         irrep_contributions_dict = exact_results_dict[jz_key]['irrep_contributions']
-        psi_exact = exact_results_dict[jz_key]['psi0']
+        psi_exact = exact_results_dict[jz_key]['eigenvectors'][:, 0]
             
         # Identificar la irrep dominante
         best_irrep_str = max(irrep_contributions_dict, key=irrep_contributions_dict.get)
