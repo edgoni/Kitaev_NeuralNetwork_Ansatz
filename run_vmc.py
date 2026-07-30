@@ -203,7 +203,7 @@ def main(args):
             ###
             driver_s2.run(n_iter=args.n_iter_2, out=tb_logger_s2, callback=[checkpoint_s2.update, logger_s2], show_progress=True)
             
-            transfer_params = checkpoint_s2.bests_state.parameters if checkpoint_s2.bests_state.parameters is not None else vstate_s2.parameters
+            transfer_params = checkpoint_s2.best_state.parameters if checkpoint_s2.best_state.parameters is not None else vstate_s2.parameters
         else:
             print("\n--- (Saltando Etapa 2 porque --use_symmetry no está activado) ---")
             transfer_params = checkpoint_s1.best_state_params if checkpoint_s1.best_state_params is not None else vstate_s1.parameters
